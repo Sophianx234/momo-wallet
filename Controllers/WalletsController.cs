@@ -159,34 +159,39 @@ public class WalletsController : ControllerBase
             senderNewBalance = senderWallet.Balance 
         });
     }
+// The route now accepts queries like: /api/wallets/0241234567/history?page=1&pageSize=5
     [HttpGet("{phoneNumber}/history")]
-    public async Task<IActionResult> GetTransactionHistory(string phoneNumber)
+    public async Task<IActionResult> GetTransactionHistory(string phoneNumber, [FromQuery] int page = 1, [FromQuery] int pageSize = 10)
     {
-        // 1. SECURITY CHECK: Verify the wallet actually exists first
         var walletExists = await _context.Wallets.AnyAsync(w => w.PhoneNumber == phoneNumber);
         
-        if (!walletExists)
-        {
-            return NotFound(new { message = "Wallet not found." });
-        }
+        if (!walletExists) return NotFound(new { message = "Wallet not found." });
 
-        // 2. THE QUERY: Fetch the ledger
-        // This translates directly to SQL: 
-        // SELECT * FROM Transactions WHERE SenderPhoneNumber = '...' OR ReceiverPhoneNumber = '...' ORDER BY CreatedAt DESC
-        var history = await _context.Transactions
+        // 1. Build the base query without executing it yet
+        var query = _context.Transactions
             .Where(t => t.SenderPhoneNumber == phoneNumber || t.ReceiverPhoneNumber == phoneNumber)
-            .OrderByDescending(t => t.CreatedAt) // Sorts so the newest transactions are first
-            .ToListAsync(); // Executes the query and returns a list
+            .OrderByDescending(t => t.CreatedAt);
 
-        // 3. Return the data
+        // 2. Count the total records so the frontend knows how many pages exist
+        var totalRecords = await query.CountAsync();
+        var totalPages = (int)Math.Ceiling(totalRecords / (double)pageSize);
+
+        // 3. The Pagination Magic: Skip the previous pages, and Take only the current page's amount
+        var history = await query
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync();
+
         return Ok(new 
         { 
             phoneNumber = phoneNumber,
-            transactionCount = history.Count,
+            currentPage = page,
+            totalPages = totalPages,
+            pageSize = pageSize,
+            totalRecords = totalRecords,
             transactions = history 
         });
     }
-
     [HttpGet("{phoneNumber}/balance")]
     public async Task<IActionResult> GetBalance(string phoneNumber)
     {
@@ -217,6 +222,77 @@ public class WalletsController : ControllerBase
             balance = walletInfo.Balance 
         });
     }
+
+    [HttpGet("resolve/{phoneNumber}")]
+    public async Task<IActionResult> ResolveAccountName(string phoneNumber)
+    {
+        // 1. We ONLY select the AccountName to save bandwidth and protect other data
+        var accountName = await _context.Wallets
+            .Where(w => w.PhoneNumber == phoneNumber)
+            .Select(w => w.AccountName)
+            .FirstOrDefaultAsync();
+
+        if (accountName == null)
+        {
+            return NotFound(new { message = "Wallet not found." });
+        }
+
+        // 2. Return just the name so the frontend can display "Transfer to Sophian?"
+        return Ok(new 
+        { 
+            phoneNumber = phoneNumber, 
+            accountName = accountName 
+        });
+    }
+
+    [HttpPost("withdraw")]
+    public async Task<IActionResult> Withdraw([FromBody] WithdrawDto request)
+    {
+        if (request.Amount <= 0) 
+            return BadRequest(new { message = "Withdrawal amount must be greater than zero." });
+
+        var wallet = await _context.Wallets
+            .FirstOrDefaultAsync(w => w.PhoneNumber == request.PhoneNumber);
+
+        if (wallet == null) 
+            return NotFound(new { message = "Wallet not found." });
+
+        // ---> SECURITY CHECK: VERIFY THE BCRYPT PIN <---
+        if (!BCrypt.Net.BCrypt.Verify(request.Pin, wallet.Pin))
+        {
+            return Unauthorized(new { message = "Incorrect MoMo PIN." }); 
+        }
+
+        // VALIDATE FUNDS
+        if (wallet.Balance < request.Amount)
+        {
+            return BadRequest(new { message = "Insufficient funds for this withdrawal." });
+        }
+
+        // THE MONEY MOVEMENT
+        wallet.Balance -= request.Amount;
+
+        // CREATE THE DIGITAL RECEIPT
+        var withdrawalRecord = new Transaction
+        {
+            SenderPhoneNumber = wallet.PhoneNumber,
+            ReceiverPhoneNumber = "AGENT", // The money leaves the system via an agent
+            Amount = request.Amount,
+            TransactionType = "Withdrawal"
+        };
+
+        _context.Transactions.Add(withdrawalRecord);
+
+        // THE ATOMIC SAVE
+        await _context.SaveChangesAsync();
+
+        return Ok(new 
+        { 
+            message = "Withdrawal successful", 
+            amountWithdrawn = request.Amount,
+            newBalance = wallet.Balance 
+        });
+    }
 }
 
 public class DepositDto
@@ -232,4 +308,12 @@ public class TransferDto
     public string ReceiverPhoneNumber { get; set; }
     public decimal Amount { get; set; }
     public string Pin { get; set; } // <--- ADD THIS LINE
+}
+
+
+public class WithdrawDto
+{
+    public string PhoneNumber { get; set; }
+    public decimal Amount { get; set; }
+    public string Pin { get; set; } // Withdrawals require a PIN!
 }
