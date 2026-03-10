@@ -21,4 +21,7 @@ public class Transaction
 
     [Required]
     public string TransactionType { get; set; } // "Transfer", "Deposit", "Withdrawal"
+
+    // The unique string sent by the mobile app to prevent double-charging
+    public string? IdempotencyKey { get; set; }
 }

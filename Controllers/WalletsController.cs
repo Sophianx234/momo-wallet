@@ -67,7 +67,10 @@ public class WalletsController : ControllerBase
         {
             return NotFound(new { message = "Wallet not found." });
         }
-
+if (!BCrypt.Net.BCrypt.Verify(request.Pin, wallet.Pin))
+        {
+            return Unauthorized(new { message = "Incorrect MoMo PIN." }); 
+        }
         // 3. Add the money to the balance
         wallet.Balance += request.Amount;
 
@@ -97,7 +100,30 @@ public class WalletsController : ControllerBase
    [HttpPost("transfer")]
     public async Task<IActionResult> Transfer([FromBody] TransferDto request)
     {
-        // 1. SECURITY CHECK: No zero or negative transfers
+        // ---> 1. IDEMPOTENCY CHECK: REQUIRE THE HEADER <---
+        if (!Request.Headers.TryGetValue("Idempotency-Key", out var idempotencyKeyValues))
+        {
+            return BadRequest(new { message = "Idempotency-Key header is required for financial transactions." });
+        }
+        
+        string idempotencyKey = idempotencyKeyValues.ToString();
+
+        // ---> 2. IDEMPOTENCY CHECK: HAVE WE SEEN THIS KEY BEFORE? <---
+        var existingTransaction = await _context.Transactions
+            .FirstOrDefaultAsync(t => t.IdempotencyKey == idempotencyKey);
+
+        if (existingTransaction != null)
+        {
+            // If we found it, DO NOT process the transfer again! 
+            // Just return a success message pretending we just did it.
+            return Ok(new 
+            { 
+                message = "Transfer already processed (Idempotent response).", 
+                amountSent = existingTransaction.Amount
+            });
+        }
+
+        // 3. SECURITY CHECK: No zero or negative transfers
         if (request.Amount <= 0)
         {
             return BadRequest(new { message = "Transfer amount must be greater than zero." });
@@ -143,6 +169,7 @@ public class WalletsController : ControllerBase
             SenderPhoneNumber = senderWallet.PhoneNumber,
             ReceiverPhoneNumber = receiverWallet.PhoneNumber,
             Amount = request.Amount,
+            IdempotencyKey = idempotencyKey,
             TransactionType = "Transfer"
         };
 
@@ -176,23 +203,40 @@ public class WalletsController : ControllerBase
         // 9. Return success
         
 // The route now accepts queries like: /api/wallets/0241234567/history?page=1&pageSize=5
-    [HttpGet("{phoneNumber}/history")]
-    public async Task<IActionResult> GetTransactionHistory(string phoneNumber, [FromQuery] int page = 1, [FromQuery] int pageSize = 10)
+    // We use POST so we can safely hide the PIN inside the request body
+    // The route is now: POST /api/wallets/history?page=1&pageSize=10
+    [HttpPost("history")]
+    public async Task<IActionResult> GetTransactionHistory(
+        [FromQuery] int page = 1, 
+        [FromQuery] int pageSize = 10, 
+        [FromBody] HistoryRequestDto request = null) // We grab the JSON body here
     {
-        var walletExists = await _context.Wallets.AnyAsync(w => w.PhoneNumber == phoneNumber);
-        
-        if (!walletExists) return NotFound(new { message = "Wallet not found." });
+        if (request == null || string.IsNullOrEmpty(request.PhoneNumber) || string.IsNullOrEmpty(request.Pin))
+        {
+            return BadRequest(new { message = "Phone number and PIN are required." });
+        }
 
-        // 1. Build the base query without executing it yet
+        // 1. FETCH THE WALLET
+        var wallet = await _context.Wallets
+            .FirstOrDefaultAsync(w => w.PhoneNumber == request.PhoneNumber);
+        
+        if (wallet == null) return NotFound(new { message = "Wallet not found." });
+
+        // ---> 2. SECURITY CHECK: VERIFY THE BCRYPT PIN <---
+        if (!BCrypt.Net.BCrypt.Verify(request.Pin, wallet.Pin))
+        {
+            return Unauthorized(new { message = "Incorrect MoMo PIN. Access denied." }); 
+        }
+
+        // 3. THE SECURE QUERY
         var query = _context.Transactions
-            .Where(t => t.SenderPhoneNumber == phoneNumber || t.ReceiverPhoneNumber == phoneNumber)
+            .Where(t => t.SenderPhoneNumber == request.PhoneNumber || t.ReceiverPhoneNumber == request.PhoneNumber)
             .OrderByDescending(t => t.CreatedAt);
 
-        // 2. Count the total records so the frontend knows how many pages exist
+        // 4. PAGINATION LOGIC
         var totalRecords = await query.CountAsync();
         var totalPages = (int)Math.Ceiling(totalRecords / (double)pageSize);
 
-        // 3. The Pagination Magic: Skip the previous pages, and Take only the current page's amount
         var history = await query
             .Skip((page - 1) * pageSize)
             .Take(pageSize)
@@ -200,7 +244,7 @@ public class WalletsController : ControllerBase
 
         return Ok(new 
         { 
-            phoneNumber = phoneNumber,
+            phoneNumber = request.PhoneNumber,
             currentPage = page,
             totalPages = totalPages,
             pageSize = pageSize,
@@ -208,37 +252,48 @@ public class WalletsController : ControllerBase
             transactions = history 
         });
     }
-    [HttpGet("{phoneNumber}/balance")]
-    public async Task<IActionResult> GetBalance(string phoneNumber)
+    // We changed this to HttpPost so it can securely accept the PIN in a JSON body!
+    [HttpPost("balance")]
+    public async Task<IActionResult> GetBalance([FromBody] BalanceRequestDto request)
     {
+        if (request == null || string.IsNullOrEmpty(request.PhoneNumber) || string.IsNullOrEmpty(request.Pin))
+        {
+            return BadRequest(new { message = "Phone number and PIN are required." });
+        }
+
         // 1. THE OPTIMIZED QUERY
-        // By using .Select(), EF Core translates this to:
-        // SELECT "AccountName", "Balance" FROM "Wallets" WHERE "PhoneNumber" = '...'
-        // It completely ignores the Id, Network, and other columns!
         var walletInfo = await _context.Wallets
-            .Where(w => w.PhoneNumber == phoneNumber)
+            .Where(w => w.PhoneNumber == request.PhoneNumber)
             .Select(w => new 
             { 
                 w.AccountName, 
-                w.Balance 
+                w.Balance,
+                w.Pin // Grab the hashed PIN from the database
             })
             .FirstOrDefaultAsync();
 
-        // 2. SECURITY CHECK
+        // 2. EXISTENCE CHECK
         if (walletInfo == null)
         {
             return NotFound(new { message = "Wallet not found." });
         }
 
-        // 3. Return the exact data needed for the mobile app screen
+        // ---> 3. SECURITY CHECK: VERIFY THE BCRYPT PIN <---
+        // Notice we are comparing against 'walletInfo.Pin' now!
+        if (!BCrypt.Net.BCrypt.Verify(request.Pin, walletInfo.Pin))
+        {
+            return Unauthorized(new { message = "Incorrect MoMo PIN." }); 
+        }
+
+        // 4. Return the exact data needed for the mobile app screen
         return Ok(new 
         { 
-            phoneNumber = phoneNumber,
+            phoneNumber = request.PhoneNumber,
             accountName = walletInfo.AccountName,
             balance = walletInfo.Balance 
         });
     }
-
+    
     [HttpGet("resolve/{phoneNumber}")]
     public async Task<IActionResult> ResolveAccountName(string phoneNumber)
     {
@@ -415,6 +470,7 @@ public class DepositDto
 {
     public string PhoneNumber { get; set; }
     public decimal Amount { get; set; }
+    public string Pin { get; set; } // Withdrawals require a PIN!
 }
 
 
@@ -440,4 +496,18 @@ public class ReversalDto
 {
     public int TransactionId { get; set; } // The exact ID of the transfer to reverse
     public string SenderPin { get; set; }  // The sender must authorize the reversal
+    public string Pin { get; set; } // <--- ADD THIS LINE
+}
+
+public class HistoryRequestDto
+{
+    public string PhoneNumber { get; set; }
+    public string Pin { get; set; }
+}
+
+public class BalanceRequestDto
+{
+    public string PhoneNumber { get; set; }
+    public string Pin { get; set; }
+}
 }
