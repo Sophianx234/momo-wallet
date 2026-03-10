@@ -151,6 +151,19 @@ public class WalletsController : ControllerBase
         // 8. THE ATOMIC SAVE
         await _context.SaveChangesAsync();
 
+        try
+        {
+            await _context.SaveChangesAsync();
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            // If PostgreSQL blocks a double-spend, it throws a DbUpdateConcurrencyException.
+            // We catch it here and return a polite error instead of crashing the server!
+            return Conflict(new { 
+                message = "Transaction could not be completed due to simultaneous account activity. Please check your balance and try again." 
+            });
+        }
+
         // 9. Return success
         return Ok(new 
         { 
@@ -159,6 +172,9 @@ public class WalletsController : ControllerBase
             senderNewBalance = senderWallet.Balance 
         });
     }
+
+        // 9. Return success
+        
 // The route now accepts queries like: /api/wallets/0241234567/history?page=1&pageSize=5
     [HttpGet("{phoneNumber}/history")]
     public async Task<IActionResult> GetTransactionHistory(string phoneNumber, [FromQuery] int page = 1, [FromQuery] int pageSize = 10)
@@ -284,7 +300,16 @@ public class WalletsController : ControllerBase
         _context.Transactions.Add(withdrawalRecord);
 
         // THE ATOMIC SAVE
-        await _context.SaveChangesAsync();
+try
+        {
+            await _context.SaveChangesAsync();
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            return Conflict(new { 
+                message = "Withdrawal could not be completed due to simultaneous account activity. Please try again." 
+            });
+        }
 
         return Ok(new 
         { 
@@ -293,7 +318,98 @@ public class WalletsController : ControllerBase
             newBalance = wallet.Balance 
         });
     }
-}
+    
+    [HttpPost("reverse")]
+    public async Task<IActionResult> ReverseTransfer([FromBody] ReversalDto request)
+    {
+        // 1. FETCH THE ORIGINAL TRANSACTION
+        var originalTx = await _context.Transactions.FindAsync(request.TransactionId);
+
+        if (originalTx == null) 
+            return NotFound(new { message = "Transaction not found." });
+
+        // 2. CONSTRAINT: Only Transfers can be reversed
+        if (originalTx.TransactionType != "Transfer") 
+            return BadRequest(new { message = "Only transfers can be reversed." });
+
+        // 3. CONSTRAINT: 24-Hour Time Limit
+        // Assuming your Transaction model has a CreatedAt property that sets the date automatically
+        if (originalTx.CreatedAt < DateTime.UtcNow.AddHours(-24))
+        {
+            return BadRequest(new { message = "Transfers older than 24 hours cannot be reversed." });
+        }
+
+        // 4. CONSTRAINT: Prevent Double Reversals
+        // Since we don't have an "IsReversed" column, we check if a Reversal transaction already exists 
+        // for this exact amount between these two people after the original transaction date.
+        var alreadyReversed = await _context.Transactions.AnyAsync(t =>
+            t.TransactionType == "Reversal" &&
+            t.Amount == originalTx.Amount &&
+            t.SenderPhoneNumber == originalTx.ReceiverPhoneNumber && // Flipped!
+            t.ReceiverPhoneNumber == originalTx.SenderPhoneNumber && // Flipped!
+            t.CreatedAt > originalTx.CreatedAt);
+
+        if (alreadyReversed)
+            return BadRequest(new { message = "This transaction has already been reversed." });
+
+        // 5. FETCH BOTH WALLETS
+        var originalSenderWallet = await _context.Wallets
+            .FirstOrDefaultAsync(w => w.PhoneNumber == originalTx.SenderPhoneNumber);
+            
+        var originalReceiverWallet = await _context.Wallets
+            .FirstOrDefaultAsync(w => w.PhoneNumber == originalTx.ReceiverPhoneNumber);
+
+        if (originalSenderWallet == null || originalReceiverWallet == null)
+            return BadRequest(new { message = "One of the associated wallets no longer exists." });
+
+        // 6. CONSTRAINT: AUTHORIZATION
+        if (!BCrypt.Net.BCrypt.Verify(request.SenderPin, originalSenderWallet.Pin))
+        {
+            return Unauthorized(new { message = "Incorrect MoMo PIN." }); 
+        }
+
+        // 7. CONSTRAINT: FUNDS AVAILABILITY
+        // If the receiver already cashed out the money, we cannot reverse it.
+        if (originalReceiverWallet.Balance < originalTx.Amount)
+        {
+            return BadRequest(new { message = "Reversal failed. The receiver has already moved or withdrawn the funds." });
+        }
+
+        // 8. THE COMPENSATING MONEY MOVEMENT (Backwards)
+        originalReceiverWallet.Balance -= originalTx.Amount;
+        originalSenderWallet.Balance += originalTx.Amount;
+
+        // 9. CREATE THE COMPENSATING RECEIPT
+        var reversalRecord = new Transaction
+        {
+            // Notice how Sender and Receiver are flipped!
+            SenderPhoneNumber = originalTx.ReceiverPhoneNumber, 
+            ReceiverPhoneNumber = originalTx.SenderPhoneNumber, 
+            Amount = originalTx.Amount,
+            TransactionType = "Reversal"
+        };
+
+        _context.Transactions.Add(reversalRecord);
+
+        // 10. THE ATOMIC SAVE
+ try
+        {
+            await _context.SaveChangesAsync();
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            return Conflict(new { 
+                message = "Reversal could not be completed due to simultaneous account activity. Please try again." 
+            });
+        }
+
+        return Ok(new 
+        { 
+            message = "Transfer successfully reversed.", 
+            amountReturned = originalTx.Amount,
+            newBalance = originalSenderWallet.Balance 
+        });
+    }
 
 public class DepositDto
 {
@@ -316,4 +432,12 @@ public class WithdrawDto
     public string PhoneNumber { get; set; }
     public decimal Amount { get; set; }
     public string Pin { get; set; } // Withdrawals require a PIN!
+}
+
+
+
+public class ReversalDto
+{
+    public int TransactionId { get; set; } // The exact ID of the transfer to reverse
+    public string SenderPin { get; set; }  // The sender must authorize the reversal
 }

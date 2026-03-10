@@ -26,4 +26,8 @@ public class Wallet
     [Required]
     [MaxLength(100)]
     public string Pin { get; set; }  // Defaulting to "0000" so your existing test wallets don't crash the database!
+
+
+    [Timestamp]
+    public uint Version { get; set; }
 }
